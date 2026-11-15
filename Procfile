@@ -1,1 +1,1 @@
-worker: python -m smcbot.main
+worker: python start.py
