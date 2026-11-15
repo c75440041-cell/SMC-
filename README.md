@@ -15,14 +15,15 @@ Diferencias respecto al Pine (todas configurables, neutras por defecto salvo las
 
 ## Estructura del repo
 ```
-smcbot/            # código del bot (main.py, __init__.py, ...)
-tests/
-start.py           # lanzador (Railway)
+smcbot/           código del bot (__init__, main, strategy, bingx, trader, telegram, config)
+tests/            pruebas (estrategia + integración contra un BingX falso)
+start.py          lanzador para Railway
 railway.json  Procfile  requirements.txt  .python-version
 .env.example  .gitignore  README.md
 ```
-Si al subir a GitHub los `.py` quedaron sueltos en la raíz, también funciona: `start.py` lo detecta.
-No subas nunca un `.env` con claves: las variables van en Railway → Variables.
+Las carpetas `smcbot/` y `tests/` tienen que subirse **como carpetas**. Si al subir a GitHub los `.py` quedan sueltos
+en la raíz, `start.py` también lo detecta y funciona, pero lo correcto es la estructura de arriba.
+Nunca subas un `.env` con claves: las variables van en Railway → Variables.
 
 ## Despliegue
 1. Telegram: crea el bot con @BotFather → `TELEGRAM_BOT_TOKEN`. Envíale un mensaje y obtén tu `TELEGRAM_CHAT_ID` (p. ej. con @userinfobot).
@@ -30,7 +31,6 @@ No subas nunca un `.env` con claves: las variables van en Railway → Variables.
 3. Sube la carpeta a un repo de GitHub.
 4. Railway → New Project → Deploy from GitHub repo → añade las variables de `.env.example` (mínimo: `TELEGRAM_*`; para operar: `BINGX_*` y `AUTO_TRADE=true`).
 5. Servicio tipo **worker** (sin puerto). Arranca con `python start.py` (ya en `railway.json` / `Procfile`).
-   `start.py` funciona tanto si el repo tiene la carpeta `smcbot/` como si los `.py` quedaron sueltos en la raíz.
 
 **Empieza con `AUTO_TRADE=false`**, comprueba las señales unos días y luego activa.
 
@@ -42,6 +42,14 @@ Si el SL es rechazado, la posición se **cierra** automáticamente. Detecta modo
 ## Rendimiento
 ~500 símbolos: calentamiento inicial ≈ 1–2 min; luego un scan por cierre de vela (+`SCAN_DELAY_SEC`) con 1 petición por símbolo.
 Ajusta `REQ_PER_SEC` si BingX devuelve límites de tasa.
+
+## Si falla al arrancar
+Mira los **Deploy Logs**. Lo primero que imprime `start.py` es `[start] Estructura detectada: ...`.
+- `ImportError: attempted relative import...` → se está ejecutando `main.py` suelto. Comprueba que el comando de arranque es `python start.py`
+  (Railway → Settings → Deploy → Custom Start Command vacío o `python start.py`).
+- `[start] ERROR: no encuentro main.py ni smcbot/main.py` → falta la carpeta `smcbot/` en el repo; debajo se lista lo que sí hay.
+- `No se pudo cargar el universo` → BingX no responde desde esa región/red; reintenta solo 5 veces y luego Railway reinicia el servicio.
+- Sin mensajes en Telegram → revisa `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID` (escríbele primero un mensaje al bot).
 
 ## Pruebas locales
 ```
