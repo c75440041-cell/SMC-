@@ -13,12 +13,24 @@ Diferencias respecto al Pine (todas configurables, neutras por defecto salvo las
 - `REQUIRE_SWEEP` (off): el Pine dibuja las barridas pero **no las exige** para entrar; con `true` sí.
 - `OB_MIN_AGE` (0): el Pine puede entrar en la misma vela que crea el OB; sube el valor para evitarlo.
 
+## Estructura del repo
+```
+smcbot/            # código del bot (main.py, __init__.py, ...)
+tests/
+start.py           # lanzador (Railway)
+railway.json  Procfile  requirements.txt  .python-version
+.env.example  .gitignore  README.md
+```
+Si al subir a GitHub los `.py` quedaron sueltos en la raíz, también funciona: `start.py` lo detecta.
+No subas nunca un `.env` con claves: las variables van en Railway → Variables.
+
 ## Despliegue
 1. Telegram: crea el bot con @BotFather → `TELEGRAM_BOT_TOKEN`. Envíale un mensaje y obtén tu `TELEGRAM_CHAT_ID` (p. ej. con @userinfobot).
 2. BingX → API: crea una clave con **Lectura + Trading de Futuros**, **sin retiros**, y limita por IP si puedes.
 3. Sube la carpeta a un repo de GitHub.
 4. Railway → New Project → Deploy from GitHub repo → añade las variables de `.env.example` (mínimo: `TELEGRAM_*`; para operar: `BINGX_*` y `AUTO_TRADE=true`).
-5. Servicio tipo **worker** (sin puerto). Arranca con `python -m smcbot.main` (ya en `railway.json` / `Procfile`).
+5. Servicio tipo **worker** (sin puerto). Arranca con `python start.py` (ya en `railway.json` / `Procfile`).
+   `start.py` funciona tanto si el repo tiene la carpeta `smcbot/` como si los `.py` quedaron sueltos en la raíz.
 
 **Empieza con `AUTO_TRADE=false`**, comprueba las señales unos días y luego activa.
 
