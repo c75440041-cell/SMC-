@@ -1,150 +1,89 @@
-"""Cliente mínimo BingX Perpetual Futures (REST, aiohttp)."""
-from __future__ import annotations
-
+"""Cliente minimo de la API publica de BingX (futuros perpetuos USDT)."""
 import asyncio
-import hashlib
-import hmac
-import json
-import logging
 import time
 
-import aiohttp
-from yarl import URL
-
-from .strategy import Candle
-
-log = logging.getLogger("bingx")
-
-
-class BingXError(Exception):
-    def __init__(self, code, msg):
-        super().__init__(f"BingX {code}: {msg}")
-        self.code = code
-        self.msg = msg
+BASE = "https://open-api.bingx.com"
+TF_SEC = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400}
 
 
 class RateLimiter:
-    def __init__(self, rps: float):
-        self.interval = 1.0 / max(rps, 0.5)
-        self._next = 0.0
-        self._lock = asyncio.Lock()
+    def __init__(self, per_sec):
+        self.gap = 1.0 / max(per_sec, 0.1)
+        self.lock = asyncio.Lock()
+        self.next = 0.0
 
     async def wait(self):
-        async with self._lock:
+        async with self.lock:
             now = time.monotonic()
-            if now < self._next:
-                await asyncio.sleep(self._next - now)
-                now = self._next
-            self._next = now + self.interval
+            if self.next > now:
+                await asyncio.sleep(self.next - now)
+            self.next = max(now, self.next) + self.gap
 
 
 class BingX:
-    BASE = "https://open-api.bingx.com"
+    def __init__(self, session, cfg):
+        self.s = session
+        self.cfg = cfg
+        self.rl = RateLimiter(cfg.REQ_PER_SEC)
+        self.tf_sec = TF_SEC.get(cfg.TIMEFRAME, 300)
 
-    def __init__(self, key: str, secret: str, rps: float = 8.0):
-        self.key = key
-        self.secret = secret
-        self.rl = RateLimiter(rps)
-        self._s: aiohttp.ClientSession | None = None
-
-    async def start(self):
-        headers = {"X-BX-APIKEY": self.key} if self.key else {}
-        self._s = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25), headers=headers)
-
-    async def close(self):
-        if self._s:
-            await self._s.close()
-
-    # ------------------------------------------------------------------
-    async def _request(self, method, path, params=None, signed=False, limited=False, retries=3):
+    async def _get(self, path, params=None, tries=3):
         last = None
-        for attempt in range(retries):
-            p = dict(params or {})
-            if signed:
-                p["timestamp"] = int(time.time() * 1000)
-                p["recvWindow"] = 5000
-            qs = "&".join(f"{k}={p[k]}" for k in sorted(p))
-            if signed:
-                sig = hmac.new(self.secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-                qs += f"&signature={sig}"
-            url = URL(f"{self.BASE}{path}" + (f"?{qs}" if qs else ""), encoded=True)
-            if limited:
-                await self.rl.wait()
+        for k in range(tries):
+            await self.rl.wait()
             try:
-                async with self._s.request(method, url) as r:
-                    txt = await r.text()
-                    if r.status == 429:
-                        await asyncio.sleep(2 + attempt * 2)
-                        last = BingXError(429, "rate limit HTTP")
-                        continue
-                    data = json.loads(txt)
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-                last = e
-                await asyncio.sleep(1 + attempt)
-                continue
-            code = int(data.get("code", 0) or 0)
-            if code == 0:
-                return data.get("data")
-            msg = str(data.get("msg", ""))
-            if code == 100410 or "rate limit" in msg.lower():
-                await asyncio.sleep(3 + attempt * 3)
-                last = BingXError(code, msg)
-                continue
-            raise BingXError(code, msg)
-        raise last if last else RuntimeError("request failed")
+                async with self.s.get(BASE + path, params=params) as r:
+                    data = await r.json(content_type=None)
+                if isinstance(data, dict) and data.get("code") in (0, "0", None):
+                    return data.get("data")
+                last = f"code={data.get('code')} msg={data.get('msg')}"
+            except Exception as e:  # red / json
+                last = repr(e)
+            await asyncio.sleep(1.5 * (k + 1))
+        raise RuntimeError(f"{path} fallo: {last}")
 
-    # ---------------- público ----------------
-    async def contracts(self):
-        return await self._request("GET", "/openApi/swap/v2/quote/contracts") or []
-
-    async def tickers(self):
-        return await self._request("GET", "/openApi/swap/v2/quote/ticker") or []
-
-    async def klines(self, symbol: str, interval: str, limit: int):
-        d = await self._request(
-            "GET", "/openApi/swap/v3/quote/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit}, limited=True)
-        out, seen = [], set()
-        for k in d or []:
-            if isinstance(k, dict):
-                t = int(k["time"])
-                cd = Candle(t, float(k["open"]), float(k["high"]), float(k["low"]),
-                            float(k["close"]), float(k.get("volume", 0) or 0))
-            else:
-                t = int(k[0])
-                cd = Candle(t, float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]))
-            if t in seen:
+    async def universe(self):
+        """Devuelve [(symbol, quoteVolume24h)] de perpetuos USDT activos, ordenados por volumen."""
+        tickers = await self._get("/openApi/swap/v2/quote/ticker")
+        active = None
+        try:
+            contracts = await self._get("/openApi/swap/v2/quote/contracts")
+            active = {x["symbol"] for x in contracts if str(x.get("status", 1)) == "1"}
+        except Exception:
+            pass
+        out = []
+        for x in tickers or []:
+            sym = x.get("symbol", "")
+            if not sym.endswith("-USDT"):
                 continue
-            seen.add(t)
-            out.append(cd)
-        out.sort(key=lambda x: x.t)
+            if active is not None and sym not in active:
+                continue
+            try:
+                qv = float(x.get("quoteVolume") or 0)
+            except ValueError:
+                qv = 0.0
+            out.append((sym, qv))
+        out.sort(key=lambda z: z[1], reverse=True)
         return out
 
-    # ---------------- privado ----------------
-    async def balance(self):
-        d = await self._request("GET", "/openApi/swap/v2/user/balance", signed=True)
-        b = d.get("balance", d) if isinstance(d, dict) else {}
-        equity = float(b.get("equity") or b.get("balance") or 0)
-        avail = float(b.get("availableMargin") or b.get("balance") or 0)
-        return {"equity": equity, "available": avail}
-
-    async def positions(self):
-        return await self._request("GET", "/openApi/swap/v2/user/positions", signed=True) or []
-
-    async def position_mode(self) -> bool:
-        d = await self._request("GET", "/openApi/swap/v1/positionSide/dual", signed=True)
-        v = d.get("dualSidePosition") if isinstance(d, dict) else d
-        return str(v).lower() == "true"
-
-    async def set_margin_type(self, symbol, mode):
-        return await self._request("POST", "/openApi/swap/v2/trade/marginType",
-                                   {"symbol": symbol, "marginType": mode}, signed=True, retries=1)
-
-    async def set_leverage(self, symbol, side, leverage):
-        return await self._request("POST", "/openApi/swap/v2/trade/leverage",
-                                   {"symbol": symbol, "side": side, "leverage": leverage},
-                                   signed=True, retries=1)
-
-    async def place_order(self, **params):
-        return await self._request("POST", "/openApi/swap/v2/trade/order", params,
-                                   signed=True, retries=1)
+    async def klines(self, symbol):
+        """Velas CERRADAS, ascendentes: [{t,o,h,l,c,v}]"""
+        params = {"symbol": symbol, "interval": self.cfg.TIMEFRAME, "limit": self.cfg.CANDLES}
+        try:
+            data = await self._get("/openApi/swap/v3/quote/klines", params)
+        except RuntimeError:
+            data = await self._get("/openApi/swap/v2/quote/klines", params)
+        rows = []
+        for k in data or []:
+            try:
+                if isinstance(k, dict):
+                    rows.append({"t": int(k["time"]), "o": float(k["open"]), "h": float(k["high"]),
+                                 "l": float(k["low"]), "c": float(k["close"]), "v": float(k["volume"])})
+                else:
+                    rows.append({"t": int(k[0]), "o": float(k[1]), "h": float(k[2]),
+                                 "l": float(k[3]), "c": float(k[4]), "v": float(k[5])})
+            except (KeyError, ValueError, IndexError):
+                continue
+        rows.sort(key=lambda r: r["t"])
+        now_ms = int(time.time() * 1000)
+        return [r for r in rows if r["t"] + self.tf_sec * 1000 <= now_ms + 1000]

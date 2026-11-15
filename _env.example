@@ -1,0 +1,36 @@
+# Variables de entorno (en Railway: servicio -> Variables). Solo las dos primeras son obligatorias.
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# 1m, 3m, 5m, 15m, 30m, 1h
+TIMEFRAME=5m
+# Cuantas senales (las mejores) se envian en cada scan
+TOP_N=5
+# Puntuacion minima 0-100 para enviar (0 = sin minimo)
+MIN_SCORE=0
+
+# Universo: volumen 24h minimo en USDT (0 = todas), MAX_SYMBOLS 0 = sin limite
+MIN_VOLUME_USDT=1000000
+MAX_SYMBOLS=0
+INCLUDE_SYMBOLS=
+EXCLUDE_SYMBOLS=
+REQ_PER_SEC=8
+SCAN_DELAY_SEC=4
+WARMUP_BARS=300
+UNIVERSE_REFRESH_MIN=60
+HEARTBEAT_HOURS=6
+SIGNAL_MAX_AGE=1
+
+# Estrategia
+SWING_LEN=5
+ENTRY_MODE=Retest OB
+OB_MITIGATION=Close through
+COOLDOWN_BARS=8
+SL_BUFFER_ATR=0.1
+RR_TARGET=2.5
+USE_LIQUIDITY_TP=true
+MIN_RR=1.5
+MAX_RISK_PCT=3.0
+REQUIRE_SWEEP=false
+SWEEP_LOOKBACK=30
+OB_MIN_AGE=1

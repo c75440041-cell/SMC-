@@ -1,255 +1,185 @@
-"""
-Port 1:1 del indicador Pine v6 "SMC Notebook · Barrida → MSS → CHOCH → OB · 5m".
-Motor incremental: una llamada on_candle() por vela CERRADA (equivale a barstate.isconfirmed).
-"""
-from __future__ import annotations
-
-from collections import deque
-from dataclasses import dataclass
-from typing import Optional
-
-KEEP = 200  # velas retenidas por símbolo
+"""Port del indicador Pine 'SMC Notebook': Barrida -> MSS -> CHOCH -> OB -> retest.
+Trabaja solo con velas cerradas. Devuelve senales puntuadas (0-100) para el ranking."""
+import math
 
 
-@dataclass
-class Candle:
-    t: int  # open time (ms)
-    o: float
-    h: float
-    l: float
-    c: float
-    v: float = 0.0
+def _atr(h, l, c, period=14):
+    n = len(c)
+    out = [None] * n
+    tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, n)]
+    if n < period:
+        return out
+    val = sum(tr[:period]) / period
+    out[period - 1] = val
+    for i in range(period, n):
+        val = (val * (period - 1) + tr[i]) / period
+        out[i] = val
+    return out
 
 
-@dataclass
-class Params:
-    swing_len: int = 5
-    entry_mode: str = "Retest OB"        # "Retest OB" | "Mitad del OB"
-    ob_mitigation: str = "Close through"  # "Close through" | "Wick through"
-    cooldown_bars: int = 8
-    sl_buffer_atr: float = 0.1
-    rr_target: float = 2.5
-    use_liquidity_tp: bool = True
-    # extras (defaults = comportamiento neutro)
-    min_rr: float = 1.0
-    max_risk_pct: float = 3.0
-    require_sweep: bool = False
-    sweep_lookback: int = 30
-    ob_min_age: int = 0
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
 
 
-@dataclass
-class OB:
-    top: float
-    bot: float
-    bar: int
-    created: int
-    kind: str      # "CHOCH" | "MSS"
-    swept: bool
-    active: bool = True
+def analyze(candles, cfg, qvol=0.0):
+    """candles: lista de dicts {t,o,h,l,c,v} ordenada y SOLO cerradas. Devuelve lista de senales recientes."""
+    n = len(candles)
+    S = cfg.SWING_LEN
+    if n < max(60, 4 * S):
+        return []
+    t = [x["t"] for x in candles]
+    o = [x["o"] for x in candles]
+    h = [x["h"] for x in candles]
+    l = [x["l"] for x in candles]
+    c = [x["c"] for x in candles]
+    v = [x["v"] for x in candles]
+    atr = _atr(h, l, c)
 
+    trend = 0
+    last_ph = last_pl = None
+    last_high = last_low = None
+    ph_list, pl_list = [], []
+    sweep_hi_bar = sweep_lo_bar = None
+    ob_bull = ob_bear = None
+    last_long = last_short = None
+    close_through = cfg.OB_MITIGATION == "Close through"
+    mid_mode = cfg.ENTRY_MODE != "Retest OB"
+    signals = []
 
-@dataclass
-class Signal:
-    side: str          # "LONG" | "SHORT"
-    entry: float
-    sl: float
-    tp: float
-    rr: float
-    tp_kind: str       # "LIQ" | "R"
-    atr: float
-    ob_top: float
-    ob_bot: float
-    ob_kind: str
-    swept: bool
-    bar_time: int
-    mode: str
+    for i in range(n):
+        # --- pivotes (confirmados S velas despues) ---
+        piv_h = piv_l = None
+        if i >= 2 * S:
+            k = i - S
+            wh = h[k - S:k + S + 1]
+            wl = l[k - S:k + S + 1]
+            if h[k] == max(wh) and wh.count(h[k]) == 1:
+                piv_h = h[k]
+            if l[k] == min(wl) and wl.count(l[k]) == 1:
+                piv_l = l[k]
+        if piv_h is not None:
+            last_ph = piv_h
+            ph_list.append(piv_h)
+        if piv_l is not None:
+            last_pl = piv_l
+            pl_list.append(piv_l)
 
+        # --- barridas ---
+        if last_ph is not None and h[i] > last_ph and c[i] < last_ph:
+            sweep_hi_bar = i
+        if last_pl is not None and l[i] < last_pl and c[i] > last_pl:
+            sweep_lo_bar = i
 
-class SMCEngine:
-    def __init__(self, p: Params):
-        self.p = p
-        self.bars: list[Candle] = []
-        self.n = -1
-        self.last_t: Optional[int] = None
-        # ATR (Wilder RMA 14)
-        self.atr: Optional[float] = None
-        self._pc: Optional[float] = None
-        self._tr_n = 0
-        self._tr_sum = 0.0
-        # swings / barridas
-        self.last_ph: Optional[float] = None
-        self.last_pl: Optional[float] = None
-        self.piv_highs: deque = deque(maxlen=40)
-        self.piv_lows: deque = deque(maxlen=40)
-        self.sweep_low_bar: Optional[int] = None
-        self.sweep_high_bar: Optional[int] = None
-        # estructura
-        self.trend = 0
-        self.last_high: Optional[float] = None
-        self.last_low: Optional[float] = None
-        # order blocks
-        self.ob_bull: Optional[OB] = None
-        self.ob_bear: Optional[OB] = None
-        # cooldown
-        self.last_long: Optional[int] = None
-        self.last_short: Optional[int] = None
-
-    # ------------------------------------------------------------------
-    def _pivots(self):
-        L = self.p.swing_len
-        b = self.bars
-        if len(b) < 2 * L + 1:
-            return None, None
-        cand = b[-1 - L]
-        left = b[-1 - 2 * L:-1 - L]
-        right = b[-L:]
-        ph = pl = None
-        if all(cand.h >= x.h for x in left) and all(cand.h > x.h for x in right):
-            ph = cand.h
-        if all(cand.l <= x.l for x in left) and all(cand.l < x.l for x in right):
-            pl = cand.l
-        return ph, pl
-
-    # ------------------------------------------------------------------
-    def on_candle(self, c: Candle) -> Optional[Signal]:
-        p = self.p
-        self.bars.append(c)
-        if len(self.bars) > KEEP:
-            del self.bars[0]
-        self.n += 1
-        i = self.n
-        b = self.bars
-        self.last_t = c.t
-
-        # ---- ATR ----
-        tr = c.h - c.l if self._pc is None else max(
-            c.h - c.l, abs(c.h - self._pc), abs(c.l - self._pc))
-        self._pc = c.c
-        self._tr_n += 1
-        if self._tr_n <= 14:
-            self._tr_sum += tr
-            if self._tr_n == 14:
-                self.atr = self._tr_sum / 14
-        else:
-            self.atr = (self.atr * 13 + tr) / 14
-
-        # ---- Swings + barridas ----
-        ph, pl = self._pivots()
-        if ph is not None:
-            self.last_ph = ph
-            self.piv_highs.append(ph)
-        if pl is not None:
-            self.last_pl = pl
-            self.piv_lows.append(pl)
-        if self.last_ph is not None and c.h > self.last_ph and c.c < self.last_ph:
-            self.sweep_high_bar = i
-        if self.last_pl is not None and c.l < self.last_pl and c.c > self.last_pl:
-            self.sweep_low_bar = i
-
-        # ---- Estructura (BOS/MSS/CHOCH) ----
-        t, lh, ll = self.trend, self.last_high, self.last_low
-        bull_bos = t <= 0 and lh is not None and c.c > lh
-        bear_bos = t >= 0 and ll is not None and c.c < ll
-        bull_choch = t == -1 and lh is not None and c.c > lh
-        bear_choch = t == 1 and ll is not None and c.c < ll
+        # --- estructura ---
+        bull_bos = trend <= 0 and last_high is not None and c[i] > last_high
+        bear_bos = trend >= 0 and last_low is not None and c[i] < last_low
+        bull_choch = trend == -1 and last_high is not None and c[i] > last_high
+        bear_choch = trend == 1 and last_low is not None and c[i] < last_low
         if bull_choch or bull_bos:
-            self.trend = 1
-            self.last_low = c.l
+            trend = 1
+            last_low = l[i]
         if bear_choch or bear_bos:
-            self.trend = -1
-            self.last_high = c.h
-        if ph is not None:
-            self.last_high = ph
-        if pl is not None:
-            self.last_low = pl
+            trend = -1
+            last_high = h[i]
+        if piv_h is not None:
+            last_high = piv_h
+        if piv_l is not None:
+            last_low = piv_l
 
-        # ---- Order Blocks ----
-        def swept(bar):
-            return bar is not None and i - bar <= p.sweep_lookback
+        # --- order blocks ---
+        if bull_choch or (bull_bos and trend == 1):
+            for j in (i - 1, i - 2):
+                if j >= 0 and c[j] < o[j]:
+                    ob_bull = {"top": h[j], "bot": l[j], "bar": j, "created": i, "active": True}
+                    break
+        if bear_choch or (bear_bos and trend == -1):
+            for j in (i - 1, i - 2):
+                if j >= 0 and c[j] > o[j]:
+                    ob_bear = {"top": h[j], "bot": l[j], "bar": j, "created": i, "active": True}
+                    break
 
-        if bull_choch or (bull_bos and self.trend == 1):
-            kind = "CHOCH" if bull_choch else "MSS"
-            if i >= 1 and len(b) >= 2 and b[-2].c < b[-2].o:
-                self.ob_bull = OB(b[-2].h, b[-2].l, i - 1, i, kind, swept(self.sweep_low_bar))
-            elif len(b) >= 3 and b[-3].c < b[-3].o:
-                self.ob_bull = OB(b[-3].h, b[-3].l, i - 2, i, kind, swept(self.sweep_low_bar))
-        if bear_choch or (bear_bos and self.trend == -1):
-            kind = "CHOCH" if bear_choch else "MSS"
-            if len(b) >= 2 and b[-2].c > b[-2].o:
-                self.ob_bear = OB(b[-2].h, b[-2].l, i - 1, i, kind, swept(self.sweep_high_bar))
-            elif len(b) >= 3 and b[-3].c > b[-3].o:
-                self.ob_bear = OB(b[-3].h, b[-3].l, i - 2, i, kind, swept(self.sweep_high_bar))
+        if ob_bull and ob_bull["active"]:
+            if (c[i] < ob_bull["bot"]) if close_through else (l[i] < ob_bull["bot"]):
+                ob_bull["active"] = False
+        if ob_bear and ob_bear["active"]:
+            if (c[i] > ob_bear["top"]) if close_through else (h[i] > ob_bear["top"]):
+                ob_bear["active"] = False
 
-        bull, bear = self.ob_bull, self.ob_bear
-        if bull and bull.active:
-            if (c.c < bull.bot) if p.ob_mitigation == "Close through" else (c.l < bull.bot):
-                bull.active = False
-        if bear and bear.active:
-            if (c.c > bear.top) if p.ob_mitigation == "Close through" else (c.h > bear.top):
-                bear.active = False
+        # --- entrada ---
+        long_entry = short_entry = False
+        if ob_bull and ob_bull["active"] and i - ob_bull["created"] >= cfg.OB_MIN_AGE:
+            if l[i] <= ob_bull["top"] and h[i] >= ob_bull["bot"]:
+                if not mid_mode:
+                    long_entry = c[i] > o[i] and c[i] > ob_bull["bot"]
+                else:
+                    long_entry = c[i] >= (ob_bull["top"] + ob_bull["bot"]) / 2
+        if ob_bear and ob_bear["active"] and i - ob_bear["created"] >= cfg.OB_MIN_AGE:
+            if h[i] >= ob_bear["bot"] and l[i] <= ob_bear["top"]:
+                if not mid_mode:
+                    short_entry = c[i] < o[i] and c[i] < ob_bear["top"]
+                else:
+                    short_entry = c[i] <= (ob_bear["top"] + ob_bear["bot"]) / 2
 
-        # ---- Entrada ----
-        touch_bull = bool(bull and bull.active and c.l <= bull.top and c.h >= bull.bot)
-        touch_bear = bool(bear and bear.active and c.h >= bear.bot and c.l <= bear.top)
-        long_e = short_e = False
-        if p.entry_mode == "Retest OB":
-            long_e = touch_bull and c.c > c.o and c.c > bull.bot
-            short_e = touch_bear and c.c < c.o and c.c < bear.top
-        else:
-            long_e = touch_bull and c.c >= (bull.top + bull.bot) / 2
-            short_e = touch_bear and c.c <= (bear.top + bear.bot) / 2
-        if long_e and (i - bull.created < p.ob_min_age or (p.require_sweep and not bull.swept)):
-            long_e = False
-        if short_e and (i - bear.created < p.ob_min_age or (p.require_sweep and not bear.swept)):
-            short_e = False
+        sig_long = long_entry and (last_long is None or i - last_long > cfg.COOLDOWN_BARS)
+        sig_short = short_entry and (last_short is None or i - last_short > cfg.COOLDOWN_BARS)
 
-        sig_long = long_e and (self.last_long is None or i - self.last_long > p.cooldown_bars)
-        sig_short = short_e and (self.last_short is None or i - self.last_short > p.cooldown_bars)
+        if cfg.REQUIRE_SWEEP:
+            if sig_long and not (sweep_lo_bar is not None and i - sweep_lo_bar <= cfg.SWEEP_LOOKBACK):
+                sig_long = False
+            if sig_short and not (sweep_hi_bar is not None and i - sweep_hi_bar <= cfg.SWEEP_LOOKBACK):
+                sig_short = False
+
+        used_bull, used_bear = ob_bull, ob_bear
         if sig_long:
-            self.last_long = i
-            bull.active = False
+            last_long = i
+            ob_bull["active"] = False
         if sig_short:
-            self.last_short = i
-            bear.active = False
-        if sig_long and sig_short:
-            return None  # señales contradictorias en la misma vela
-        if sig_long:
-            return self._build("LONG", bull, c)
-        if sig_short:
-            return self._build("SHORT", bear, c)
-        return None
+            last_short = i
+            ob_bear["active"] = False
 
-    # ------------------------------------------------------------------
-    def _build(self, side: str, ob: OB, c: Candle) -> Optional[Signal]:
-        p = self.p
-        atr = self.atr or 0.0
-        entry = c.c
-        if side == "LONG":
-            sl = ob.bot - p.sl_buffer_atr * atr
-            risk = entry - sl
-        else:
-            sl = ob.top + p.sl_buffer_atr * atr
-            risk = sl - entry
-        if risk <= 0 or entry <= 0:
-            return None
-        if risk / entry * 100 > p.max_risk_pct:
-            return None
-
-        tp, kind = None, "R"
-        if p.use_liquidity_tp:
+        # --- construir senal solo si es reciente ---
+        if (sig_long or sig_short) and i >= n - 1 - cfg.SIGNAL_MAX_AGE and atr[i]:
+            side = "LONG" if sig_long else "SHORT"
+            ob = used_bull if sig_long else used_bear
+            entry = c[i]
             if side == "LONG":
-                for lv in sorted(x for x in self.piv_highs if x > entry):
-                    if (lv - entry) / risk >= p.min_rr:
-                        tp, kind = lv, "LIQ"
-                        break
+                sl = ob["bot"] - cfg.SL_BUFFER_ATR * atr[i]
+                risk = entry - sl
+                cands = [p for p in ph_list[-60:] if p > entry]
+                swept = sweep_lo_bar is not None and i - sweep_lo_bar <= cfg.SWEEP_LOOKBACK
             else:
-                for lv in sorted((x for x in self.piv_lows if x < entry), reverse=True):
-                    if (entry - lv) / risk >= p.min_rr:
-                        tp, kind = lv, "LIQ"
-                        break
-        if tp is None:
-            tp = entry + risk * p.rr_target if side == "LONG" else entry - risk * p.rr_target
-        rr = abs(tp - entry) / risk
-        return Signal(side, entry, sl, tp, rr, kind, atr, ob.top, ob.bot, ob.kind,
-                      ob.swept, c.t, p.entry_mode)
+                sl = ob["top"] + cfg.SL_BUFFER_ATR * atr[i]
+                risk = sl - entry
+                cands = [p for p in pl_list[-60:] if p < entry]
+                swept = sweep_hi_bar is not None and i - sweep_hi_bar <= cfg.SWEEP_LOOKBACK
+            if risk <= 0 or risk / entry * 100 > cfg.MAX_RISK_PCT:
+                continue
+            tp = None
+            if cfg.USE_LIQUIDITY_TP:
+                good = [p for p in cands if cfg.MIN_RR <= abs(p - entry) / risk <= 6.0]
+                if good:
+                    tp = min(good) if side == "LONG" else max(good)
+            if tp is None:
+                tp = entry + risk * cfg.RR_TARGET if side == "LONG" else entry - risk * cfg.RR_TARGET
+            rr = abs(tp - entry) / risk
+
+            # puntuacion 0-100
+            avg_v = sum(v[max(0, i - 20):i]) / max(1, len(v[max(0, i - 20):i]))
+            vol_ratio = v[i] / avg_v if avg_v > 0 else 1.0
+            rng = h[i] - l[i]
+            body = abs(c[i] - o[i]) / rng if rng > 0 else 0
+            risk_atr = risk / atr[i]
+            score = (
+                min(rr, 4.0) / 4.0 * 30
+                + (20 if swept else 0)
+                + _clamp(1.0 - (risk_atr - 0.5) / 4.0) * 15
+                + min(vol_ratio, 3.0) / 3.0 * 15
+                + body * 10
+                + (_clamp(math.log10(qvol / 1e6) / 3.0) * 10 if qvol > 1e6 else 0)
+            )
+            signals.append({
+                "side": side, "bar": i, "time": t[i], "entry": entry, "sl": sl, "tp": tp,
+                "rr": rr, "score": round(score, 1), "swept": swept, "vol_ratio": vol_ratio,
+                "risk_pct": risk / entry * 100,
+            })
+    return signals
