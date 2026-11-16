@@ -7,3 +7,6 @@ __pycache__/
 venv/
 *.zip
 .DS_Store
+
+# diario local
+journal.db

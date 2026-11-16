@@ -1,63 +1,49 @@
-# SMC Notebook Bot (BingX · Telegram · Railway)
+# SMC Bot v2 (BingX · Telegram · Railway)
 
-Port 1:1 del indicador Pine v6 **SMC Notebook · Barrida → MSS → CHOCH → OB · 5m**.
-Escanea **todos los perpetuos USDT de BingX** (filtrados por volumen 24h), envía señales a Telegram y, opcionalmente, opera.
+Escanea **todos** los perpetuos USDT de BingX (sin filtro de volumen; la puerta `liquid` solo deja enviar señales de monedas con volumen 24h ≥ `MIN_LIQ_USDT`; las demás quedan en el diario), puntúa los setups y envía a Telegram el **TOP 5** al cierre de cada vela.
+Solo señales: no opera. **Todos los archivos van en la raíz del repo, sin carpetas.**
 
-## Lógica
-Swings (pivotes) → barridas de liquidez → MSS/BOS → CHOCH → Order Block (última vela contraria) → entrada en retest del OB
-(`Retest OB` o `Mitad del OB`) → SL bajo/sobre el OB + ATR·colchón → TP en liquidez opuesta o R fijo. Todo sobre **velas cerradas**.
+## Archivos
+`main.py` (bucle) · `strategy.py` (flags, puntuación, SL/TP) · `setups.py` (4 setups) · `context.py` (series causales) · `indicators.py` · `zones.py` ·
+`journal.py` (diario + informe) · `bingx.py` · `notifier.py` · `backtest.py` · `test_all.py` · `start.py` · `Procfile` · `railway.json` · `requirements.txt` ·
+`_env.example` `_gitignore` `_python-version` (renómbralos con punto: `.env.example`, `.gitignore`, `.python-version`; son opcionales).
 
-Diferencias respecto al Pine (todas configurables, neutras por defecto salvo las dos primeras):
-- TP de liquidez: el Pine usa el último pivote, que a menudo queda del lado equivocado del precio. El bot usa el **pivote más cercano a favor con R:R ≥ `MIN_RR`**; si no hay, usa `RR_TARGET`.
-- `MAX_RISK_PCT`: descarta señales con SL demasiado lejos.
-- `REQUIRE_SWEEP` (off): el Pine dibuja las barridas pero **no las exige** para entrar; con `true` sí.
-- `OB_MIN_AGE` (0): el Pine puede entrar en la misma vela que crea el OB; sube el valor para evitarlo.
+## Setups
+- **SMC**: barrida → MSS/CHOCH → Order Block → retest (port del Pine "SMC Notebook").
+- **P7H**: nivel 25% del rango de la vela anterior de 7h + vela *Strong Closure*. El modo `retest` es un retest real (el Pine original actuaba como ruptura).
+- **ZONE**: ruptura + retest de zonas de liquidez (pivotes con grosor ATR), simétrico arriba y abajo (el Pine solo funcionaba al alza).
+- **TRAIL**: retest del trail (EMA ± ATR) tras un cambio de tendencia; la espera caduca.
 
-## Estructura del repo
-```
-smcbot/           código del bot (__init__, main, strategy, bingx, trader, telegram, config)
-tests/            pruebas (estrategia + integración contra un BingX falso)
-start.py          lanzador para Railway
-railway.json  Procfile  requirements.txt  .python-version
-.env.example  .gitignore  README.md
-```
-Las carpetas `smcbot/` y `tests/` tienen que subirse **como carpetas**. Si al subir a GitHub los `.py` quedan sueltos
-en la raíz, `start.py` también lo detecta y funciona, pero lo correcto es la estructura de arriba.
-Nunca subas un `.env` con claves: las variables van en Railway → Variables.
+## Flags y puntuación (0–100)
+Cada señal lleva flags: `htf15 htf1h trend5 btc adx session weekday sweep sweep_htf disp strong zone range_pos rvol`.
+`GATES` = flags obligatorios para enviar (por defecto `htf15,cost,liquid`). `cost` exige que las comisiones (taker 0,05% por lado en BingX perpetuos + deslizamiento = `COST_PCT` 0,12%) no se coman más del 25% de 1R. El resto suma puntos; las puertas activas se excluyen de la puntuación para no contarlas dos veces.
+Objetivos: TP1/TP2/TP3 (1R/2R/3R) y un objetivo de **liquidez** colocado justo antes del nivel opuesto más cercano. Plan: en TP1 cierra parte y mueve el SL a break-even.
+El TOP limita a `MAX_SAME_DIR` longs o shorts para no apostar cinco veces a lo mismo.
+Cada mensaje indica hasta qué precio sigue válida la entrada (`MAX_CHASE_R`); si el precio ya se alejó, la señal no se envía (queda en el diario). Con `ACCOUNT_USDT` > 0 muestra también el tamaño de posición para arriesgar `RISK_PCT`%.
+
+## Diario y modo sombra
+Todas las señales (también las que no pasan las puertas) se guardan en SQLite y se siguen vela a vela: TP1/TP2/TP3 alcanzados antes del SL, SL, o caducada.
+Cada día a `REPORT_HOUR_UTC` llega un **informe** con win rate y expectativa en R **neta de costes**, con error estándar, por setup y por flag. La sección *Conclusiones sólidas* solo propone cambios si son estadísticamente claros (z ≥ 3); si no, dice que es ruido.
+**Railway:** conecta un *Volume* al servicio (Railway define `RAILWAY_VOLUME_MOUNT_PATH` y el bot lo usa solo). Sin volumen el diario se borra en cada despliegue y el bot te avisa al arrancar.
 
 ## Despliegue
-1. Telegram: crea el bot con @BotFather → `TELEGRAM_BOT_TOKEN`. Envíale un mensaje y obtén tu `TELEGRAM_CHAT_ID` (p. ej. con @userinfobot).
-2. BingX → API: crea una clave con **Lectura + Trading de Futuros**, **sin retiros**, y limita por IP si puedes.
-3. Sube la carpeta a un repo de GitHub.
-4. Railway → New Project → Deploy from GitHub repo → añade las variables de `.env.example` (mínimo: `TELEGRAM_*`; para operar: `BINGX_*` y `AUTO_TRADE=true`).
-5. Servicio tipo **worker** (sin puerto). Arranca con `python start.py` (ya en `railway.json` / `Procfile`).
+1. Telegram: @BotFather → `TELEGRAM_BOT_TOKEN`; escríbele un mensaje y saca tu `TELEGRAM_CHAT_ID` (p. ej. con @userinfobot).
+2. Sube TODOS los archivos a GitHub (sin carpetas) y despliega en Railway como servicio *worker*.
+3. Variables: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (+ las de `_env.example` que quieras cambiar).
+4. Railway → Settings → Deploy → Custom Start Command: vacío o `python main.py`.
 
-**Empieza con `AUTO_TRADE=false`**, comprueba las señales unos días y luego activa.
-
-## Ejecución de órdenes
-Entrada a mercado + `STOP_MARKET` (SL) + `TAKE_PROFIT_MARKET` (TP), margen aislado, apalancamiento `LEVERAGE`.
-Tamaño = `RISK_PCT`% del equity / distancia al SL, limitado por `MAX_MARGIN_PCT`. Máx. `MAX_POSITIONS` simultáneas, una por símbolo.
-Si el SL es rechazado, la posición se **cierra** automáticamente. Detecta modo hedge/one-way solo.
-
-## Rendimiento
-~500 símbolos: calentamiento inicial ≈ 1–2 min; luego un scan por cierre de vela (+`SCAN_DELAY_SEC`) con 1 petición por símbolo.
-Ajusta `REQ_PER_SEC` si BingX devuelve límites de tasa.
-
-## Si falla al arrancar
-Mira los **Deploy Logs**. Lo primero que imprime `start.py` es `[start] Estructura detectada: ...`.
-- `ImportError: attempted relative import...` → se está ejecutando `main.py` suelto. Comprueba que el comando de arranque es `python start.py`
-  (Railway → Settings → Deploy → Custom Start Command vacío o `python start.py`).
-- `[start] ERROR: no encuentro main.py ni smcbot/main.py` → falta la carpeta `smcbot/` en el repo; debajo se lista lo que sí hay.
-- `No se pudo cargar el universo` → BingX no responde desde esa región/red; reintenta solo 5 veces y luego Railway reinicia el servicio.
-- Sin mensajes en Telegram → revisa `TELEGRAM_BOT_TOKEN` y `TELEGRAM_CHAT_ID` (escríbele primero un mensaje al bot).
-
-## Pruebas locales
+## Backtest y pruebas
 ```
 pip install -r requirements.txt
-python -m tests.test_strategy
-python -m tests.test_app
-cp .env.example .env   # y exporta las variables
-python -m smcbot.main
+python test_all.py                                   # pruebas (sin red)
+python backtest.py --symbols BTC-USDT,ETH-USDT --days 30
+python backtest.py --top 20 --days 30
+python backtest.py --top 20 --days 30 --optimize     # busca puertas con validación train/test
 ```
+`--optimize` prueba combinaciones de hasta 3 puertas en el 70% inicial y las comprueba en el 30% final. Con 13 flags hay cientos de combinaciones, así que la mejor en train casi siempre es suerte: solo cuenta lo que sigue positivo en test (n ≥ 100). Si dice "ninguna es creíble", no cambies nada.
+El backtest usa la misma lógica que el bot en vivo (el flag `btc` se asume cumplido). `--synthetic` usa datos inventados solo para comprobar que funciona: **sus resultados no significan nada**.
 
-> Trading con apalancamiento = riesgo de pérdida total. Sin garantías; úsalo bajo tu responsabilidad.
+## Notas
+- La vela de 7h: por defecto bloques 0-7-14-21 UTC (`P7H_ALIGN=day`). Compáralo con tu gráfico de BingX; si no coincide, prueba `continuous`.
+- Consumo: ~500 monedas × 1000 velas por scan (unos 10 ms de CPU por moneda). Si Railway da 429, baja `REQ_PER_SEC`; si va justo de CPU, baja `WARMUP_BARS` (mínimo ~800 para el filtro de 1h).
+- Trading con apalancamiento = riesgo de pérdida total. Sin garantías.
